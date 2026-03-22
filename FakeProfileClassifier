@@ -1,0 +1,292 @@
+import numpy as np
+import pandas as pd
+import re
+import random
+import string
+from datetime import datetime, timedelta
+from sklearn.model_selection import train_test_split, cross_val_score, StratifiedKFold
+from sklearn.feature_extraction.text import TfidfVectorizer
+from sklearn.preprocessing import StandardScaler
+from sklearn.ensemble import RandomForestClassifier
+from sklearn.pipeline import Pipeline, FeatureUnion
+from sklearn.base import BaseEstimator, TransformerMixin
+from sklearn.metrics import (
+    classification_report,
+    roc_auc_score,
+    roc_curve,
+    confusion_matrix,
+    accuracy_score,
+)
+import joblib
+import matplotlib.pyplot as plt
+
+# 1) Synthetic dataset generator
+
+def random_date(start_days_ago=2000, end_days_ago=1):
+    days = random.randint(end_days_ago, start_days_ago)
+    return (datetime.now() - timedelta(days=days)).date()
+
+def gen_text(is_fake):
+    """
+    Generate fake/real-like bio or recent posts text.
+    Fake accounts often have short repeated phrases, many URLs, promotional text.
+    Real accounts are more varied and natural language.
+    """
+    promos = [
+        "Buy now", "Limited offer", "Click here", "Visit my profile", "Free gift",
+        "Follow us", "Earn money", "Discount", "Subscribe", "Deal"
+    ]
+    normal = [
+        "Love hiking and coffee", "Software developer", "Mother of two", "Photography",
+        "Enjoy reading novels", "Student at university", "Foodie", "Traveler", "Dog lover"
+    ]
+    if is_fake:
+        # more urls, hashtags, short repeated tokens
+        chunks = []
+        for _ in range(random.randint(1, 4)):
+            if random.random() < 0.6:
+                chunks.append(random.choice(promos))
+            else:
+                chunks.append("www." + "".join(random.choices(string.ascii_lowercase, k=6)) + ".com")
+        # add maybe 1 or 2 hashtags
+        hashes = " ".join("#" + "".join(random.choices(["deal","promo","sale","win","giveaway"], k=1)) for _ in range(random.randint(0,2)))
+        return (" ".join(chunks) + " " + hashes).strip()
+    else:
+        sent = " ".join(random.choices(normal, k=random.randint(1,4)))
+        # sometimes include personal pronoun
+        if random.random() < 0.5:
+            sent += " | " + random.choice(["I love it", "based in India", "living in NYC", "open to collabs"])
+        return sent
+
+def generate_synthetic_dataset(n=5000, fake_frac=0.2, random_state=42):
+    random.seed(random_state)
+    np.random.seed(random_state)
+    rows = []
+    for i in range(n):
+        is_fake = random.random() < fake_frac
+        followers = int(np.clip(np.random.normal(50 if is_fake else 800, 200 if is_fake else 800), 0, 200000))
+        following = int(np.clip(np.random.normal(300 if is_fake else 350, 150 if is_fake else 300), 0, 200000))
+        posts_count = int(np.clip(np.random.normal(10 if is_fake else 500, 40 if is_fake else 600), 0, 50000))
+        acct_age_days = int(np.clip(np.random.exponential(200 if is_fake else 1000), 1, 10000))
+        bio = gen_text(is_fake)
+        recent_posts = " ".join(gen_text(is_fake) for _ in range(random.randint(1,5)))
+        has_profile_image = int(random.random() < (0.2 if is_fake else 0.9))
+        uses_default_image = int(random.random() < (0.7 if is_fake else 0.05))
+        url_in_bio = int(bool(re.search(r'http|www', bio)))
+        hashtags_per_post = np.clip(np.random.poisson(1 if is_fake else 0.5), 0, 10)
+        mentions_per_post = np.clip(np.random.poisson(1 if is_fake else 0.2), 0, 10)
+        language = random.choice(["en","en","en","es","fr","hi"])  # more english
+        # synthetic label: 1 fake, 0 real
+        rows.append({
+            "user_id": f"user_{i}",
+            "followers": followers,
+            "following": following,
+            "posts_count": posts_count,
+            "account_age_days": acct_age_days,
+            "bio": bio,
+            "recent_posts": recent_posts,
+            "has_profile_image": has_profile_image,
+            "uses_default_image": uses_default_image,
+            "url_in_bio": url_in_bio,
+            "hashtags_per_post": hashtags_per_post,
+            "mentions_per_post": mentions_per_post,
+            "language": language,
+            "is_fake": int(is_fake),
+        })
+    return pd.DataFrame(rows)
+
+# 2) Feature transformers
+
+class TextSelector(BaseEstimator, TransformerMixin):
+    """Select a single text column for the pipeline."""
+    def __init__(self, key):
+        self.key = key
+    def fit(self, X, y=None):
+        return self
+    def transform(self, X):
+        return X[self.key].astype(str).values
+
+class NumberSelector(BaseEstimator, TransformerMixin):
+    """Select numeric columns and return as numpy array."""
+    def __init__(self, keys):
+        self.keys = keys
+    def fit(self, X, y=None):
+        return self
+    def transform(self, X):
+        return X[self.keys].values.astype(float)
+
+def add_engineered_features(df):
+    """Add simple ratio and derived features."""
+    df2 = df.copy()
+    # follower-following ratio (guard divide by zero)
+    df2["follower_following_ratio"] = df2.apply(
+        lambda r: (r["followers"] + 1) / (r["following"] + 1), axis=1
+    )
+    # posts per day
+    df2["posts_per_day"] = df2["posts_count"] / (df2["account_age_days"] + 1)
+    # short_bio flag
+    df2["short_bio"] = df2["bio"].apply(lambda s: 1 if len(s.split()) <= 3 else 0)
+    # many_hashtags flag
+    df2["many_hashtags"] = (df2["hashtags_per_post"] > 2).astype(int)
+    # suspicious_profile_image (default + no profile image)
+    df2["suspicious_profile_image"] = ((df2["uses_default_image"] == 1) & (df2["has_profile_image"] == 0)).astype(int)
+    # bio_url_count
+    df2["bio_url_count"] = df2["bio"].apply(lambda s: len(re.findall(r'http|www', s)))
+    return df2
+
+
+# 3) Build pipeline and train
+
+def build_and_train(df, model_out_path="fake_detector_rf.joblib"):
+    df = add_engineered_features(df)
+    X = df.drop(columns=["user_id","is_fake"])
+    y = df["is_fake"].values
+
+    # Text pipeline for 'recent_posts' and 'bio'
+    bio_tfidf = Pipeline([
+        ("selector", TextSelector("bio")),
+        ("tfidf", TfidfVectorizer(max_features=300, ngram_range=(1,2), stop_words="english")),
+    ])
+    posts_tfidf = Pipeline([
+        ("selector", TextSelector("recent_posts")),
+        ("tfidf", TfidfVectorizer(max_features=600, ngram_range=(1,2), stop_words="english")),
+    ])
+
+    # Numeric features
+    numeric_keys = [
+        "followers","following","posts_count","account_age_days",
+        "follower_following_ratio","posts_per_day","short_bio",
+        "many_hashtags","suspicious_profile_image","bio_url_count",
+        "hashtags_per_post","mentions_per_post"
+    ]
+    numeric_pipeline = Pipeline([
+        ("selector", NumberSelector(numeric_keys)),
+        ("scaler", StandardScaler()),
+    ])
+
+    # Combine features
+    combined = FeatureUnion([
+        ("bio_tfidf", bio_tfidf),
+        ("posts_tfidf", posts_tfidf),
+        ("numeric", numeric_pipeline),
+    ])
+
+    # Complete pipeline
+    pipeline = Pipeline([
+        ("features", combined),
+        ("clf", RandomForestClassifier(
+            n_estimators=200,
+            max_depth=15,
+            class_weight="balanced",
+            random_state=42,
+            n_jobs=-1
+        ))
+    ])
+
+    # Train/test split
+    X_train, X_test, y_train, y_test = train_test_split(X, y, stratify=y, test_size=0.2, random_state=42)
+
+    print("Training model...")
+    pipeline.fit(X_train, y_train)
+
+    # Save model and metadata (needed columns, etc.)
+    joblib.dump({
+        "pipeline": pipeline,
+        "numeric_keys": numeric_keys,
+        "feature_columns": X.columns.tolist()
+    }, model_out_path)
+    print(f"Model saved to {model_out_path}")
+
+    # Evaluate
+    y_pred = pipeline.predict(X_test)
+    y_proba = pipeline.predict_proba(X_test)[:,1]
+    print("\nTest set evaluation:")
+    print(classification_report(y_test, y_pred, digits=4))
+    try:
+        auc = roc_auc_score(y_test, y_proba)
+        print(f"ROC AUC: {auc:.4f}")
+    except Exception:
+        pass
+
+    cm = confusion_matrix(y_test, y_pred)
+    print("Confusion matrix:\n", cm)
+    return pipeline, X_test, y_test
+
+# ------------------------
+# 4) Simple prediction wrapper
+# ------------------------
+def load_model(path="fake_detector_rf.joblib"):
+    d = joblib.load(path)
+    return d["pipeline"], d
+
+def predict_account_is_fake(pipeline, account_record):
+    """
+    account_record: dict with keys matching the training columns except label & user_id.
+    Example:
+      account = {
+        "followers": 120,
+        "following": 900,
+        "posts_count": 3,
+        "account_age_days": 20,
+        "bio": "Buy now - great deals at www.deals.com",
+        "recent_posts": "Buy now! Click here www.x.com",
+        "has_profile_image": 0,
+        "uses_default_image": 1,
+        "url_in_bio": 1,
+        "hashtags_per_post": 3,
+        "mentions_per_post": 0,
+        "language": "en"
+      }
+    Returns: dict with probability and prediction (0=real,1=fake)
+    """
+    # convert to DataFrame expected by pipeline and recompute engineered features
+    df = pd.DataFrame([account_record])
+    df = add_engineered_features(df)
+    pred_proba = pipeline.predict_proba(df)[:,1][0]
+    pred_label = int(pred_proba >= 0.5)
+    return {"is_fake_prob": float(pred_proba), "is_fake": pred_label}
+
+# ------------------------
+# 5) Entry point: generate data, train, test and demo predictions
+# ------------------------
+if __name__ == "__main__":
+    print("Generating synthetic dataset...")
+    df = generate_synthetic_dataset(n=6000, fake_frac=0.22)
+    print("Dataset shape:", df.shape)
+    pipeline, X_test, y_test = build_and_train(df, model_out_path="fake_detector_rf.joblib")
+
+    # Demo: load model and predict a few example accounts
+    loaded_pipeline, meta = load_model("fake_detector_rf.joblib")
+    demo_accounts = [
+        {
+            "followers": 10,
+            "following": 500,
+            "posts_count": 2,
+            "account_age_days": 10,
+            "bio": "Click here for a free gift www.freegift.com #giveaway",
+            "recent_posts": "Free gift click now www.freegift.com #win",
+            "has_profile_image": 0,
+            "uses_default_image": 1,
+            "url_in_bio": 1,
+            "hashtags_per_post": 3,
+            "mentions_per_post": 0,
+            "language": "en"
+        },
+        {
+            "followers": 4200,
+            "following": 350,
+            "posts_count": 1200,
+            "account_age_days": 2000,
+            "bio": "Software engineer | Open source enthusiast | India",
+            "recent_posts": "Working on a new ML project, loved this paper on transformers",
+            "has_profile_image": 1,
+            "uses_default_image": 0,
+            "url_in_bio": 0,
+            "hashtags_per_post": 0,
+            "mentions_per_post": 1,
+            "language": "en"
+        }
+    ]
+    for a in demo_accounts:
+        r = predict_account_is_fake(loaded_pipeline, a)
+        print("Account:", a["bio"][:60], "->", r)
